@@ -1,5 +1,6 @@
 beautifulsoup4
 openpyxl
 pandas
+pyodbc
 requests
 urllib3
