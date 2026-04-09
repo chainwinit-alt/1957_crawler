@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from html import escape
 from pathlib import Path
-from typing import Iterable
-from urllib.parse import parse_qs, urljoin, urlparse
+from typing import Any, Iterable
+from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 import pandas as pd
 import requests
@@ -21,7 +23,10 @@ from urllib3.util.retry import Retry
 BASE_URL = "https://1957.mohw.gov.tw"
 DEFAULT_ROOT_CATE_ID = "1"
 DEFAULT_TIMEOUT = 30
+DEFAULT_DISCONTINUED_TIME = "3333-03-31 00:00:00"
+DEFAULT_OFFICE_UNIT_ID = 1
 ILLEGAL_EXCEL_CHAR_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+PHONE_RE = re.compile(r"(?:\+886[-\s]?)?0\d{1,2}[-\s]?\d{3,4}[-\s]?\d{3,4}(?:#\d+)?")
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -75,6 +80,335 @@ def build_default_output() -> Path:
     return desktop / f"1957縣市政策_{stamp}.xlsx"
 
 
+def normalize_lookup_key(text: str | None) -> str:
+    value = normalize_space(text)
+    value = value.replace("臺", "台").replace("／", "/").replace("＆", "&")
+    value = value.replace("‧", "").replace("·", "").replace(" ", "")
+    return value
+
+
+def build_lookup(raw_map: dict[str, int]) -> dict[str, int]:
+    return {normalize_lookup_key(label): code_id for label, code_id in raw_map.items()}
+
+
+def split_non_empty_lines(text: str) -> list[str]:
+    return [line for line in (normalize_space(part) for part in text.splitlines()) if line]
+
+
+def html_fragment_to_text(fragment: str) -> str:
+    html = re.sub(r"<br\s*/?>", "\n", fragment or "", flags=re.IGNORECASE)
+    soup = BeautifulSoup(html, "html.parser")
+    return "\n".join(split_non_empty_lines(soup.get_text("\n", strip=True)))
+
+
+def text_to_html_paragraphs(text: str) -> str:
+    paragraphs = split_non_empty_lines(text)
+    return "".join(f"<p>{line}</p>" for line in paragraphs)
+
+
+def quote_html_fragment(fragment: str) -> str:
+    html = fragment.strip()
+    return quote(html, safe="") if html else ""
+
+
+def truncate_for_db(value: str, limit: int, field_name: str, warnings: list[str]) -> str:
+    text = normalize_space(value)
+    if len(text) <= limit:
+        return text
+    warnings.append(f"{field_name} 超過 {limit} 字已截斷")
+    return text[:limit]
+
+
+def first_phone(text: str) -> str:
+    match = PHONE_RE.search(text or "")
+    return match.group(0) if match else ""
+
+
+def json_compact(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+RAW_CODE_POLICY_MAP = {
+    "社會保險": 1,
+    "社會救助": 2,
+    "兒少福利": 3,
+    "家庭福利": 4,
+    "老人福利": 5,
+    "長期照顧": 6,
+    "身心障礙服務": 7,
+    "勞工福利": 8,
+    "住宅福利": 9,
+    "原民福利": 10,
+    "其他福利": 11,
+    "身心障礙福利": 12,
+    "微型保險": 13,
+    "各式民間資源": 14,
+}
+
+
+RAW_CODE_DOMICILE_MAP = {
+    "全國": 1,
+    "新北市": 2,
+    "台北市": 3,
+    "桃園市": 4,
+    "台中市": 5,
+    "台南市": 6,
+    "高雄市": 7,
+    "基隆市": 8,
+    "新竹縣": 9,
+    "新竹市": 10,
+    "苗栗縣": 11,
+    "彰化縣": 12,
+    "南投縣": 13,
+    "雲林縣": 14,
+    "嘉義縣": 15,
+    "嘉義市": 16,
+    "屏東縣": 17,
+    "宜蘭縣": 18,
+    "花蓮縣": 19,
+    "台東縣": 20,
+    "澎湖縣": 21,
+    "金門縣": 22,
+    "連江縣": 23,
+}
+
+
+RAW_CODE_KEYWORD_MAP = {
+    "失業": 1,
+    "就業": 2,
+    "健康": 3,
+    "生育": 4,
+    "托育": 5,
+    "租屋": 6,
+    "急難": 7,
+    "喪葬": 8,
+    "健保": 9,
+    "勞保": 10,
+    "國保": 11,
+    "農保": 12,
+    "醫療": 13,
+    "重大傷病": 14,
+    "身心障礙": 15,
+    "特殊境遇": 16,
+    "法律協助": 17,
+    "經濟補助": 18,
+    "教育": 19,
+    "輔具": 20,
+    "敬老愛心卡": 21,
+    "老年基礎保證年金": 22,
+    "老人津貼": 23,
+    "長期照顧": 24,
+    "原住民": 25,
+    "共餐送餐": 26,
+    "老花眼鏡": 27,
+    "中低收入老人生活津貼": 28,
+    "住宅修繕補助": 29,
+    "低收入戶": 30,
+    "中低收入戶": 31,
+    "假牙補助": 32,
+    "防走失手鍊": 33,
+    "緊急救援系統": 34,
+    "老農津貼": 35,
+    "日間照顧": 36,
+    "住宿式照顧": 37,
+    "聯合奠祭": 38,
+    "環保自然葬": 39,
+    "新住民": 40,
+    "看護": 41,
+    "志願服務": 42,
+    "社會住宅": 43,
+    "獨居老人": 44,
+    "社會安全網": 45,
+    "災害": 46,
+    "銀髮家園": 47,
+    "罕見疾病": 48,
+    "中高齡": 49,
+    "微型保險": 50,
+    "喘息服務": 51,
+    "心理健康": 52,
+    "交通": 53,
+    "早期療育": 54,
+    "法律": 55,
+}
+
+
+RAW_CODE_RECIPIENT_MAP = {
+    "全選": 1,
+    "嬰幼兒": 2,
+    "兒童＆青少年": 3,
+    "成人": 4,
+    "老人": 5,
+}
+
+
+RAW_CODE_INCOME_MAP = {
+    "全選": 1,
+    "經濟弱勢": 2,
+    "中低收入戶": 3,
+    "低收入戶": 4,
+}
+
+
+RAW_CODE_IDENTITY_MAP = {
+    "全選": 1,
+    "身心障礙": 2,
+    "特殊境遇": 3,
+    "重大傷病": 4,
+    "原住民": 5,
+    "新住民": 6,
+    "無": 7,
+}
+
+
+CODE_POLICY_LOOKUP = build_lookup(RAW_CODE_POLICY_MAP)
+CODE_DOMICILE_LOOKUP = build_lookup(RAW_CODE_DOMICILE_MAP)
+
+POLICY_LABEL_ALIASES = {
+    normalize_lookup_key("兒童及少年福利"): "兒少福利",
+    normalize_lookup_key("兒童少年福利"): "兒少福利",
+    normalize_lookup_key("原住民福利"): "原民福利",
+    normalize_lookup_key("原住民族福利"): "原民福利",
+    normalize_lookup_key("長期照護"): "長期照顧",
+    normalize_lookup_key("身心障礙服務"): "身心障礙福利",
+}
+
+
+DOMICILE_LABEL_ALIASES = {
+    normalize_lookup_key("全國福利"): "全國",
+    normalize_lookup_key("中央"): "全國",
+    normalize_lookup_key("臺北市"): "台北市",
+    normalize_lookup_key("臺中市"): "台中市",
+    normalize_lookup_key("臺南市"): "台南市",
+    normalize_lookup_key("臺東縣"): "台東縣",
+}
+
+
+SECTION_ALIAS_GROUPS = {
+    "qualification": [
+        "申請資格",
+        "資格條件",
+        "申請條件",
+        "申辦資格",
+        "服務對象",
+        "補助對象",
+        "適用對象",
+        "請領資格",
+        "資格",
+        "申請對象",
+        "實施對象",
+        "收托資格",
+        "收托對象",
+    ],
+    "benefit": [
+        "補助內容",
+        "給付標準",
+        "補助內容/給付標準",
+        "給付內容",
+        "補助標準",
+        "補助額度",
+        "服務內容",
+        "補助項目",
+        "補貼標準",
+        "優惠內容",
+        "檢查項目",
+        "檢查費用",
+        "內容",
+        "補助原則",
+        "補助對象及內容",
+    ],
+    "apply": [
+        "申請方式",
+        "申請流程",
+        "申請期限",
+        "申請方式/流程/期限",
+        "申辦方式",
+        "申辦流程",
+        "辦理方式",
+        "辦理流程",
+        "辦理期限",
+        "申請時間",
+        "受理申請時間",
+        "受理申請期間",
+        "申請說明",
+        "流程",
+        "交付方式",
+        "檢查地點",
+        "檢查流程",
+        "補助方式",
+        "辦理單位",
+        "承辦資訊",
+        "承辦單位",
+        "聯繫單位",
+        "聯絡資訊",
+        "承辦資訊",
+    ],
+    "evidence": ["應備文件", "應附文件", "檢附文件", "應備資料", "應檢附文件", "應備證件", "檢附資料", "準備文件"],
+    "remark": ["備註", "注意事項", "請領限制", "法規依據", "實施時間"],
+    "source": ["資料來源", "資訊來源"],
+}
+
+
+SECTION_LOOKUP = {
+    normalize_lookup_key(alias): canonical
+    for canonical, aliases in SECTION_ALIAS_GROUPS.items()
+    for alias in aliases
+}
+
+
+PLAIN_TEXT_HEADING_RE = re.compile(
+    r"^(?P<prefix>(?:[※＊*]\s*)?(?:[（(]?[一二三四五六七八九十百千\d]+[）).、．]\s*)?)(?P<title>[^：:]{1,40})(?P<suffix>[：:]?.*)$"
+)
+
+
+KEYWORD_PATTERNS = {
+    "生育": [r"生育", r"育兒", r"孕前", r"懷孕", r"孕婦", r"生產"],
+    "托育": [r"托育", r"托嬰", r"幼兒", r"育兒"],
+    "租屋": [r"租屋", r"租金", r"租賃"],
+    "急難": [r"急難", r"紓困", r"緊急救助"],
+    "喪葬": [r"喪葬", r"死亡給付", r"殯葬"],
+    "勞保": [r"勞保", r"勞工保險"],
+    "國保": [r"國民年金", r"國保"],
+    "農保": [r"農保", r"農民"],
+    "醫療": [r"醫療", r"住院", r"看護"],
+    "教育": [r"教育", r"就學", r"學生", r"學校", r"助學金", r"獎助學金", r"學雜費"],
+    "法律協助": [r"法律協助", r"法律扶助", r"法律諮詢"],
+    "經濟補助": [r"補助", r"津貼", r"補貼", r"給付", r"救助"],
+    "長期照顧": [r"長期照顧", r"長照"],
+    "原住民": [r"原住民"],
+    "新住民": [r"新住民"],
+    "身心障礙": [r"身心障礙", r"身障"],
+    "重大傷病": [r"重大傷病"],
+    "特殊境遇": [r"特殊境遇"],
+    "社會住宅": [r"社會住宅"],
+    "看護": [r"看護"],
+    "早期療育": [r"早期療育"],
+}
+
+
+RECIPIENT_PATTERNS = {
+    "嬰幼兒": [r"嬰幼兒", r"幼兒", r"嬰兒", r"托育", r"托嬰", r"育兒", r"未滿2歲"],
+    "兒童＆青少年": [r"兒童", r"少年", r"青少年", r"子女", r"學生", r"就學", r"高中", r"高職", r"國中", r"國小", r"大專"],
+    "成人": [r"成人", r"勞工", r"就業", r"失業", r"申請人", r"配偶", r"租金"],
+    "老人": [r"老人", r"老年", r"長者", r"敬老", r"65歲", r"70歲"],
+}
+
+
+INCOME_PATTERNS = {
+    "經濟弱勢": [r"經濟弱勢", r"弱勢", r"清寒", r"生活困難"],
+    "中低收入戶": [r"中低收入戶", r"中低收"],
+    "低收入戶": [r"低收入戶"],
+}
+
+
+IDENTITY_PATTERNS = {
+    "身心障礙": [r"身心障礙", r"身障"],
+    "特殊境遇": [r"特殊境遇"],
+    "重大傷病": [r"重大傷病"],
+    "原住民": [r"原住民"],
+    "新住民": [r"新住民"],
+}
+
+
 class Mohw1957CountyCrawler:
     def __init__(
         self,
@@ -91,7 +425,9 @@ class Mohw1957CountyCrawler:
         self.sleep_seconds = sleep_seconds
         self.max_policies = max_policies
         self.timeout = timeout
-        self.rows: list[dict[str, str]] = []
+        self.rows: list[dict[str, Any]] = []
+        self.db_ready_rows: list[dict[str, Any]] = []
+        self.db_payloads: list[dict[str, Any]] = []
         self.visited_category_ids: set[str] = set()
         self.visited_qa_ids: set[str] = set()
         self.session = self._build_session()
@@ -129,9 +465,6 @@ class Mohw1957CountyCrawler:
         declared = (response.encoding or "").strip().lower()
         detected = (response.apparent_encoding or "").strip().lower()
 
-        # Prefer the server-declared charset when present. A few detail pages
-        # advertise Big5 correctly but chardet guesses an incorrect Latin
-        # encoding, which turns the content into mojibake.
         if declared and declared not in {"ascii", "iso-8859-1"}:
             response.encoding = declared
         elif detected and detected != "ascii":
@@ -200,7 +533,56 @@ class Mohw1957CountyCrawler:
                     "資料來源連結",
                     "附件名稱列表",
                     "附件ID列表",
+                    "申請資格",
+                    "補助內容",
+                    "申請方式",
+                    "應備文件",
+                    "備註",
                     "內文",
+                ]
+            )
+        return df
+
+    def db_ready_dataframe(self) -> pd.DataFrame:
+        df = pd.DataFrame(self.db_ready_rows)
+        if df.empty:
+            return pd.DataFrame(
+                columns=[
+                    "Title",
+                    "Qualification",
+                    "WelfareInfo",
+                    "Evidence",
+                    "IFareOfficeUnitID",
+                    "OfficeUnitInfo",
+                    "OfficeUnitTel",
+                    "CodePolicyID",
+                    "CodeDomicileID",
+                    "CodeIndentityIDs",
+                    "CodeIncomeIDs",
+                    "CodeRecipientIDs",
+                    "CodeKeywordIDs",
+                    "CompetentAuthority",
+                    "ReleaseTime",
+                    "DiscontinuedTime",
+                    "Remark",
+                    "IsEnabled",
+                    "CodePolicyLabel",
+                    "CodeDomicileLabel",
+                    "CodeIdentityLabels",
+                    "CodeIncomeLabels",
+                    "CodeRecipientLabels",
+                    "CodeKeywordLabels",
+                    "RawTitle",
+                    "TitleWasTrimmed",
+                    "SourceName",
+                    "SourceUrl",
+                    "PolicyUrl",
+                    "SID",
+                    "UpdatedAt",
+                    "WelfareInfoHtmlPreview",
+                    "ApplyInfoPreview",
+                    "MappingWarnings",
+                    "PolicyPayloadJson",
                 ]
             )
         return df
@@ -275,9 +657,11 @@ class Mohw1957CountyCrawler:
             for anchor in group_td.select("table#QADataListTB a[href*='QACtrl?func=QAView']"):
                 if self.max_policies is not None and len(self.rows) >= self.max_policies:
                     return
-                row = self._build_row_from_listing(anchor, path, group_title, cate_id, list_url)
-                self.rows.append(row)
-                print(f"  - {row['政策標題']}")
+                raw_row, db_row, payload = self._build_rows_from_listing(anchor, path, group_title, cate_id, list_url)
+                self.rows.append(raw_row)
+                self.db_ready_rows.append(db_row)
+                self.db_payloads.append(payload)
+                print(f"  - {raw_row['政策標題']}")
 
     def _extract_group_title(self, group_td: Tag) -> str:
         parts: list[str] = []
@@ -296,14 +680,14 @@ class Mohw1957CountyCrawler:
                     parts.append(text)
         return normalize_group_title(" ".join(parts))
 
-    def _build_row_from_listing(
+    def _build_rows_from_listing(
         self,
         anchor: Tag,
         path: list[str],
         group_title: str,
         cate_id: str,
         list_url: str,
-    ) -> dict[str, str]:
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         policy_title = normalize_space(anchor.get_text(" ", strip=True))
         policy_url = urljoin(BASE_URL, anchor.get("href", ""))
         sid = parse_qs(urlparse(policy_url).query).get("sid", [""])[0]
@@ -313,7 +697,7 @@ class Mohw1957CountyCrawler:
             path, group_title
         )
 
-        return {
+        raw_row = {
             "根分類": first_level,
             "第一層分類": first_level,
             "第二層分類": second_level,
@@ -334,8 +718,15 @@ class Mohw1957CountyCrawler:
             "資料來源連結": detail["source_url"],
             "附件名稱列表": detail["attachment_names"],
             "附件ID列表": detail["attachment_ids"],
+            "申請資格": detail["qualification_text"],
+            "補助內容": detail["benefit_text"],
+            "申請方式": detail["apply_text"],
+            "應備文件": detail["evidence_text"],
+            "備註": detail["remark_text"],
             "內文": detail["content_text"],
         }
+        db_row, payload = self._build_db_ready_row(raw_row, detail)
+        return raw_row, db_row, payload
 
     def _map_path_fields(self, path: list[str], group_title: str) -> tuple[str, str, str, str, str, str]:
         first_level = path[0] if len(path) > 0 else ""
@@ -347,7 +738,7 @@ class Mohw1957CountyCrawler:
             welfare_category = third_level
             welfare_subcategory = group_title
         else:
-            county_label = "全國福利"
+            county_label = "全國"
             welfare_category = first_level
             welfare_subcategory = second_level
 
@@ -375,37 +766,234 @@ class Mohw1957CountyCrawler:
         attachment_names: list[str] = []
         attachment_ids: list[str] = []
         content_text = ""
+        qualification_text = ""
+        benefit_text = ""
+        benefit_html = ""
+        apply_text = ""
+        apply_html = ""
+        evidence_text = ""
+        remark_text = ""
+        source_section_text = ""
+        attachment_html = ""
+        attachment_text = ""
 
         if content_div is not None:
             content_text, updated_raw = self._extract_text_and_updated_time(content_div)
             updated_ad = roc_datetime_to_ad(updated_raw)
 
+            sections = self._extract_sections(content_div)
+            if not sections or not any(section.get("text") for section in sections.values()):
+                sections = self._extract_sections_from_plain_text(content_text)
+            else:
+                fallback_sections = self._extract_sections_from_plain_text(content_text)
+                for key, section in fallback_sections.items():
+                    if key not in sections or not sections[key].get("text"):
+                        sections[key] = section
+
+            qualification_text = sections.get("qualification", {}).get("text", "")
+            benefit_text = sections.get("benefit", {}).get("text", "")
+            benefit_html = sections.get("benefit", {}).get("html", "")
+            apply_text = sections.get("apply", {}).get("text", "")
+            apply_html = sections.get("apply", {}).get("html", "")
+            evidence_text = sections.get("evidence", {}).get("text", "")
+            remark_text = sections.get("remark", {}).get("text", "")
+            source_section_text = sections.get("source", {}).get("text", "")
+
             for anchor in content_div.find_all("a", href=True):
                 href = anchor.get("href", "").strip()
                 label = normalize_space(anchor.get_text(" ", strip=True))
-                if not href:
+                if not href or not label:
                     continue
-                if not source_name and "資料來源" in content_text and label and "downloadFile" not in (anchor.get("onclick") or ""):
+                if "downloadFile" in (anchor.get("onclick") or ""):
+                    continue
+                if not source_name:
                     source_name = label
                     source_url = urljoin(BASE_URL, href)
 
             for anchor in content_div.find_all("a", onclick=True):
                 onclick = anchor.get("onclick", "")
-                match = re.search(r"downloadFile\(\"?(\d+)\"?\)", onclick)
+                match = re.search(r'downloadFile\("?(\d+)"?\)', onclick)
                 if not match:
                     continue
                 attachment_ids.append(match.group(1))
                 attachment_names.append(normalize_space(anchor.get_text(" ", strip=True)))
+
+            if not source_name and source_section_text:
+                source_name = source_section_text.splitlines()[0]
+
+            attachment_html, attachment_text = self._build_attachment_section(attachment_names, attachment_ids)
+            if attachment_html:
+                if benefit_html:
+                    benefit_html = "\n".join(part for part in [benefit_html, attachment_html] if part)
+                elif content_text:
+                    benefit_html = "\n".join(
+                        part for part in [text_to_html_paragraphs(content_text), attachment_html] if part
+                    )
+                else:
+                    benefit_html = attachment_html
+
+            if attachment_text:
+                benefit_text = "\n".join(part for part in [benefit_text, attachment_text] if part)
+
+            if not any([qualification_text, benefit_text, apply_text, evidence_text, remark_text]) and content_text:
+                benefit_text = content_text
+                benefit_html = text_to_html_paragraphs(content_text)
 
         return {
             "updated_raw": updated_raw,
             "updated_ad": updated_ad,
             "source_name": source_name,
             "source_url": source_url,
-            "attachment_names": " | ".join([name for name in attachment_names if name]),
+            "source_section_text": source_section_text,
+            "attachment_names": " | ".join(name for name in attachment_names if name),
             "attachment_ids": " | ".join(attachment_ids),
             "content_text": content_text,
+            "qualification_text": qualification_text,
+            "benefit_text": benefit_text,
+            "benefit_html": benefit_html,
+            "apply_text": apply_text,
+            "apply_html": apply_html,
+            "evidence_text": evidence_text,
+            "remark_text": remark_text,
+            "attachment_text": attachment_text,
+            "attachment_html": attachment_html,
         }
+
+    def _extract_sections(self, content_div: Tag) -> dict[str, dict[str, str]]:
+        sections: dict[str, dict[str, str]] = {}
+        html = content_div.decode_contents()
+        heading_re = re.compile(
+            r"<p[^>]*>\s*(?:&#10148;|&#10146;|➤|►)?\s*(?P<title>[^:<：<]{1,40}(?:/[^:<：<]{1,40})?)\s*[:：]\s*</p>",
+            re.IGNORECASE,
+        )
+
+        matches: list[tuple[re.Match[str], str]] = []
+        for match in heading_re.finditer(html):
+            key = SECTION_LOOKUP.get(normalize_lookup_key(match.group("title")))
+            if key:
+                matches.append((match, key))
+
+        for index, (match, key) in enumerate(matches):
+            start = match.end()
+            end = matches[index + 1][0].start() if index + 1 < len(matches) else len(html)
+            body = html[start:end].strip()
+            body = re.sub(r"^\s*</p>\s*", "", body, flags=re.IGNORECASE)
+            body = re.sub(r"\s*</p>\s*$", "", body, flags=re.IGNORECASE)
+            body = re.sub(r"<span[^>]*>[^<]*資料修改時間[^<]*</span>", "", body, flags=re.IGNORECASE)
+            self._flush_section(sections, key, [body])
+
+        return sections
+
+    def _extract_sections_from_plain_text(self, content_text: str) -> dict[str, dict[str, str]]:
+        sections: dict[str, dict[str, str]] = {}
+        current_key = ""
+        current_lines: list[str] = []
+
+        def flush() -> None:
+            nonlocal current_key, current_lines
+            if not current_key or not current_lines:
+                current_key = ""
+                current_lines = []
+                return
+            self._flush_section(sections, current_key, [text_to_html_paragraphs("\n".join(current_lines))])
+            current_key = ""
+            current_lines = []
+
+        for raw_line in split_non_empty_lines(content_text):
+            if raw_line == "附件下載：" or raw_line == "附件下載":
+                flush()
+                continue
+
+            heading_key, inline_body = self._extract_text_section_heading(raw_line)
+            if heading_key:
+                flush()
+                current_key = heading_key
+                if inline_body:
+                    current_lines.append(inline_body)
+                continue
+
+            if current_key:
+                current_lines.append(raw_line)
+
+        flush()
+        return sections
+
+    def _extract_section_heading(self, node: Tag | NavigableString) -> str:
+        if not isinstance(node, Tag):
+            return ""
+        text = normalize_space(node.get_text(" ", strip=True))
+        if not text or len(text) > 40:
+            return ""
+        text = text.lstrip("➜►●■◆※")
+        text = normalize_group_title(text)
+        return SECTION_LOOKUP.get(normalize_lookup_key(text), "")
+
+    def _extract_text_section_heading(self, line: str) -> tuple[str, str]:
+        text = normalize_space(line)
+        if not text:
+            return "", ""
+
+        match = PLAIN_TEXT_HEADING_RE.match(text)
+        if not match:
+            return "", ""
+
+        title = normalize_space(match.group("title"))
+        suffix = normalize_space(match.group("suffix"))
+        title = title.lstrip("※＊*").strip()
+
+        candidates = [title]
+        if "：" in title:
+            candidates.append(normalize_space(title.split("：", 1)[0]))
+        if ":" in title:
+            candidates.append(normalize_space(title.split(":", 1)[0]))
+
+        for candidate in candidates:
+            normalized = normalize_lookup_key(candidate)
+            direct = SECTION_LOOKUP.get(normalized)
+            if direct:
+                inline_body = ""
+                if suffix.startswith("：") or suffix.startswith(":"):
+                    inline_body = normalize_space(suffix[1:])
+                return direct, inline_body
+
+            for alias_key, canonical in SECTION_LOOKUP.items():
+                alias_plain = normalize_space(alias_key)
+                if normalized.startswith(alias_key):
+                    inline_body = normalize_space(candidate[len(alias_plain) :])
+                    if inline_body.startswith("：") or inline_body.startswith(":"):
+                        inline_body = normalize_space(inline_body[1:])
+                    return canonical, inline_body
+
+        return "", ""
+
+    def _flush_section(self, sections: dict[str, dict[str, str]], key: str, fragments: list[str]) -> None:
+        if not key:
+            return
+        html = "".join(fragments).strip()
+        text = html_fragment_to_text(html)
+        if not html and not text:
+            return
+        if key in sections:
+            sections[key]["html"] = "\n".join(part for part in [sections[key]["html"], html] if part)
+            sections[key]["text"] = "\n".join(part for part in [sections[key]["text"], text] if part)
+            return
+        sections[key] = {"html": html, "text": text}
+
+    def _build_attachment_section(self, attachment_names: list[str], attachment_ids: list[str]) -> tuple[str, str]:
+        items = [(name, attachment_id) for name, attachment_id in zip(attachment_names, attachment_ids) if name and attachment_id]
+        if not items:
+            return "", ""
+
+        html_items = []
+        text_items = ["附件下載："]
+        for name, attachment_id in items:
+            download_url = urljoin(BASE_URL, f"/servlet/KBDataCtrl?func=downloadFile&sId={attachment_id}")
+            html_items.append(f'<li><a href="{download_url}" target="_blank" rel="noopener noreferrer">{escape(name)}</a></li>')
+            text_items.append(name)
+
+        html = "<p>附件下載：</p><ul>" + "".join(html_items) + "</ul>"
+        text = "\n".join(text_items)
+        return html, text
 
     def _extract_text_and_updated_time(self, content_div: Tag) -> tuple[str, str]:
         content_html = str(content_div)
@@ -426,14 +1014,204 @@ class Mohw1957CountyCrawler:
 
         return ("\n".join(lines).strip(), updated_raw)
 
+    def _build_db_ready_row(self, raw_row: dict[str, Any], detail: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any]]:
+        warnings: list[str] = []
+        raw_title = normalize_space(str(raw_row["政策標題"]))
+        title = truncate_for_db(raw_title, 50, "Title", warnings)
+        title_was_trimmed = title != raw_title
+
+        code_policy_id, code_policy_label = self._lookup_policy_code(str(raw_row["福利分類"]))
+        if code_policy_id is None:
+            warnings.append(f"找不到 CodePolicyID: {raw_row['福利分類']}")
+
+        code_domicile_id, code_domicile_label = self._lookup_domicile_code(str(raw_row["縣市"]))
+        if code_domicile_id is None:
+            warnings.append(f"找不到 CodeDomicileID: {raw_row['縣市']}")
+
+        content_blob = "\n".join(
+            part
+            for part in [
+                raw_title,
+                detail["qualification_text"],
+                detail["benefit_text"],
+                detail["apply_text"],
+                detail["evidence_text"],
+                detail["remark_text"],
+                detail["content_text"],
+            ]
+            if part
+        )
+
+        keyword_ids, keyword_labels = self._infer_multi_codes(content_blob, RAW_CODE_KEYWORD_MAP, KEYWORD_PATTERNS, None)
+        if not keyword_ids and re.search(r"補助|津貼|補貼|給付|救助", content_blob):
+            keyword_ids = [RAW_CODE_KEYWORD_MAP["經濟補助"]]
+            keyword_labels = ["經濟補助"]
+
+        recipient_ids, recipient_labels = self._infer_multi_codes(content_blob, RAW_CODE_RECIPIENT_MAP, RECIPIENT_PATTERNS, "全選")
+        income_ids, income_labels = self._infer_multi_codes(content_blob, RAW_CODE_INCOME_MAP, INCOME_PATTERNS, "全選")
+        identity_ids, identity_labels = self._infer_multi_codes(content_blob, RAW_CODE_IDENTITY_MAP, IDENTITY_PATTERNS, "全選")
+
+        welfare_html_preview = self._compose_welfare_html(detail)
+        welfare_info = quote_html_fragment(welfare_html_preview)
+
+        office_unit_info_raw = self._extract_office_unit_info(detail["apply_text"], detail["source_name"])
+        office_unit_info = truncate_for_db(office_unit_info_raw, 100, "OfficeUnitInfo", warnings)
+        office_unit_tel = truncate_for_db(first_phone("\n".join([detail["apply_text"], detail["content_text"]])), 100, "OfficeUnitTel", warnings)
+        competent_authority = truncate_for_db(detail["source_name"], 50, "CompetentAuthority", warnings)
+        remark = truncate_for_db(detail["remark_text"], 100, "Remark", warnings)
+        office_unit_id = self._infer_office_unit_id(office_unit_info, competent_authority, detail["apply_text"])
+
+        payload: dict[str, Any] = {
+            "Title": title,
+            "Qualification": detail["qualification_text"],
+            "WelfareInfo": welfare_info,
+            "Evidence": detail["evidence_text"],
+            "IFareOfficeUnitID": office_unit_id,
+            "OfficeUnitInfo": office_unit_info,
+            "OfficeUnitTel": office_unit_tel,
+            "CodePolicyID": code_policy_id,
+            "CodeDomicileID": code_domicile_id,
+            "CodeIndentityIDs": identity_ids,
+            "CodeIncomeIDs": income_ids,
+            "CodeRecipientIDs": recipient_ids,
+            "CodeKeywordIDs": keyword_ids,
+            "CompetentAuthority": competent_authority,
+            "ReleaseTime": raw_row["更新時間"] or None,
+            "DiscontinuedTime": DEFAULT_DISCONTINUED_TIME,
+            "Remark": remark,
+            "IsEnabled": True,
+        }
+
+        db_row = {
+            "Title": title,
+            "Qualification": detail["qualification_text"],
+            "WelfareInfo": welfare_info,
+            "Evidence": detail["evidence_text"],
+            "IFareOfficeUnitID": office_unit_id,
+            "OfficeUnitInfo": office_unit_info,
+            "OfficeUnitTel": office_unit_tel,
+            "CodePolicyID": code_policy_id,
+            "CodeDomicileID": code_domicile_id,
+            "CodeIndentityIDs": json_compact(identity_ids),
+            "CodeIncomeIDs": json_compact(income_ids),
+            "CodeRecipientIDs": json_compact(recipient_ids),
+            "CodeKeywordIDs": json_compact(keyword_ids),
+            "CompetentAuthority": competent_authority,
+            "ReleaseTime": raw_row["更新時間"] or "",
+            "DiscontinuedTime": DEFAULT_DISCONTINUED_TIME,
+            "Remark": remark,
+            "IsEnabled": True,
+            "CodePolicyLabel": code_policy_label,
+            "CodeDomicileLabel": code_domicile_label,
+            "CodeIdentityLabels": " | ".join(identity_labels),
+            "CodeIncomeLabels": " | ".join(income_labels),
+            "CodeRecipientLabels": " | ".join(recipient_labels),
+            "CodeKeywordLabels": " | ".join(keyword_labels),
+            "RawTitle": raw_title,
+            "TitleWasTrimmed": title_was_trimmed,
+            "SourceName": detail["source_name"],
+            "SourceUrl": detail["source_url"],
+            "PolicyUrl": raw_row["政策連結"],
+            "SID": raw_row["SID"],
+            "UpdatedAt": raw_row["更新時間"],
+            "WelfareInfoHtmlPreview": welfare_html_preview,
+            "ApplyInfoPreview": detail["apply_text"],
+            "MappingWarnings": " | ".join(warnings),
+            "PolicyPayloadJson": json_compact(payload),
+        }
+        return db_row, payload
+
+    def _lookup_policy_code(self, label: str) -> tuple[int | None, str]:
+        key = normalize_lookup_key(label)
+        canonical = POLICY_LABEL_ALIASES.get(key, normalize_space(label))
+        return CODE_POLICY_LOOKUP.get(normalize_lookup_key(canonical)), canonical
+
+    def _lookup_domicile_code(self, label: str) -> tuple[int | None, str]:
+        key = normalize_lookup_key(label)
+        canonical = DOMICILE_LABEL_ALIASES.get(key, normalize_space(label))
+        return CODE_DOMICILE_LOOKUP.get(normalize_lookup_key(canonical)), canonical
+
+    def _infer_multi_codes(
+        self,
+        text: str,
+        raw_map: dict[str, int],
+        pattern_map: dict[str, list[str]],
+        default_label: str | None,
+    ) -> tuple[list[int], list[str]]:
+        labels: list[str] = []
+        for label in raw_map:
+            if label == "全選":
+                continue
+            patterns = pattern_map.get(label)
+            if not patterns:
+                if label == "無":
+                    continue
+                patterns = [re.escape(label)]
+            if any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns):
+                labels.append(label)
+        if not labels and default_label:
+            labels.append(default_label)
+        ids = [raw_map[label] for label in labels]
+        return ids, labels
+
+    def _compose_welfare_html(self, detail: dict[str, str]) -> str:
+        parts: list[str] = []
+        if detail["benefit_html"]:
+            parts.append(f"<p>補助內容/給付標準：</p>{detail['benefit_html']}")
+        if detail["apply_html"]:
+            parts.append(f"<p>申請方式/流程/期限：</p>{detail['apply_html']}")
+        if not parts and detail["benefit_text"]:
+            parts.append(text_to_html_paragraphs(detail["benefit_text"]))
+        if not parts and detail["apply_text"]:
+            parts.append(text_to_html_paragraphs(detail["apply_text"]))
+        return "".join(parts).strip()
+
+    def _extract_office_unit_info(self, apply_text: str, source_name: str) -> str:
+        if apply_text:
+            one_line = " ".join(split_non_empty_lines(apply_text))
+            patterns = [
+                r"向(?P<value>[^。；，]{2,50}?公所)提出申請",
+                r"向(?P<value>[^。；，]{2,80}?)提出申請",
+                r"於(?P<value>[^。；，]{2,80}?)提出申請",
+                r"至(?P<value>[^。；，]{2,80}?)申請",
+                r"向(?P<value>[^。；，]{2,80}?)辦理",
+                r"洽(?P<value>[^。；，]{2,80}?)辦理",
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, one_line)
+                if match:
+                    return normalize_space(match.group("value"))
+            lines = split_non_empty_lines(apply_text)
+            if lines:
+                return re.sub(r"^[（(]?[一二三四五六七八九十\d]+[）)]", "", lines[0]).strip()
+        return normalize_space(source_name)
+
+    def _infer_office_unit_id(self, office_unit_info: str, competent_authority: str, apply_text: str) -> int:
+        text = "\n".join(part for part in [office_unit_info, competent_authority, apply_text] if part)
+        if "輔具中心" in text:
+            return 3
+        if "戶政" in text:
+            return 4
+        if "社會安全網" in text:
+            return 5
+        if "公所" in text:
+            return 2
+        return DEFAULT_OFFICE_UNIT_ID
+
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="爬取衛福部 1957 縣市福利與全國福利政策資料")
+    parser = argparse.ArgumentParser(description="爬取衛福部 1957 縣市福利與全國福利政策資料，並輸出 IFare DB-ready 格式")
     parser.add_argument(
         "--output",
         type=Path,
         default=build_default_output(),
         help="輸出的 Excel 路徑，預設為桌面時間戳檔名",
+    )
+    parser.add_argument(
+        "--db-json-output",
+        type=Path,
+        default=None,
+        help="另存一份可直接餵 API/後續匯入程式的 JSON payload",
     )
     parser.add_argument(
         "--root-cate-id",
@@ -485,15 +1263,27 @@ def main(argv: Iterable[str]) -> int:
     )
 
     try:
-        df = crawler.crawl()
+        raw_df = crawler.crawl()
     except Exception as exc:
         print(f"爬取失敗：{exc}", file=sys.stderr)
         return 1
 
-    df = df.map(sanitize_for_excel)
+    db_df = crawler.db_ready_dataframe()
+    raw_df = raw_df.map(sanitize_for_excel)
+    db_df = db_df.map(sanitize_for_excel)
+
     ensure_parent_dir(args.output)
-    df.to_excel(args.output, index=False)
-    print(f"完成，共 {len(df)} 筆，已輸出到：{args.output}")
+    with pd.ExcelWriter(args.output) as writer:
+        raw_df.to_excel(writer, index=False, sheet_name="raw_1957")
+        db_df.to_excel(writer, index=False, sheet_name="db_ifare_policy")
+
+    if args.db_json_output is not None:
+        ensure_parent_dir(args.db_json_output)
+        args.db_json_output.write_text(json.dumps(crawler.db_payloads, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"完成，共 {len(raw_df)} 筆。Excel 已輸出到：{args.output}")
+    if args.db_json_output is not None:
+        print(f"DB-ready JSON 已輸出到：{args.db_json_output}")
     return 0
 
 
