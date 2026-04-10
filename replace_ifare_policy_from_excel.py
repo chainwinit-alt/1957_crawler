@@ -1,3 +1,19 @@
+"""將 db_ifare_policy 工作表整批寫入 IFare DB 的工具。
+
+這支程式不是單純 insert，而是完整的「覆蓋式匯入」流程：
+1. 找到桌面最新的爬蟲 Excel。
+2. 讀取 db_ifare_policy 工作表並做資料正規化。
+3. 驗證必要欄位是否齊全。
+4. 將現有政策主表與關聯表完整備份。
+5. 產生可回滾的 restore SQL。
+6. 清空舊資料後重新寫入新政策。
+
+因此它最重要的設計目標不是速度，而是：
+- 可還原
+- 可檢查
+- 失敗時不要留下半套資料
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -12,9 +28,14 @@ import pandas as pd
 import pyodbc
 
 
+# 連線目標目前寫死在本機 SQL Server instance。
+# 若網站實際使用的是 default instance 或其他主機，這裡一定要同步調整。
 SERVER = r"localhost\SQLEXPRESS"
 DATABASE = "IFare"
-SHEET_NAME = "db_ifare_policy"
+# 新版 crawler 最終只輸出一張工作表 ifare_policy，
+# 欄位內容沿用原本 db_ifare_policy 的結構。
+SHEET_NAME = "ifare_policy"
+# 建立者 / 異動者目前固定寫同一位系統帳號。
 CREATE_USER_ID = 1
 DEFAULT_OFFICE_UNIT_ID = 1
 DRIVER_CANDIDATES = (
@@ -38,6 +59,8 @@ POLICY_CODE_OVERRIDES = {
     "社會救助專戶、國民年金": 2,
 }
 
+# 主表與多對多關聯表。
+# 程式會先清除關聯表，再清主表，最後按同樣順序寫回資料。
 POLICY_TABLE = "dbo.IFarePolicy"
 LINK_TABLE_SPECS = (
     ("dbo.IFarePolicy_CodeKeyword", "CodeKeyword_ID", "CodeKeywordIDs"),
@@ -49,24 +72,34 @@ ALL_POLICY_TABLES = tuple(spec[0] for spec in LINK_TABLE_SPECS) + (POLICY_TABLE,
 
 
 def parse_args() -> argparse.Namespace:
+    """保留 argparse 入口介面。
+
+    目前實作上沒有真的讀 CLI 參數，而是走自動抓桌面最新 Excel 的流程。
+    這個函式算是未來若要改成命令列版時的保留點。
+    """
+
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     workspace = Path.cwd()
     return argparse.ArgumentParser(
-        description="Backup existing IFare policy tables, then replace them with db_ifare_policy data from Excel."
+        description="Backup existing IFare policy tables, then replace them with ifare_policy data from Excel."
     ).parse_args(
         []
     )
 
 
 def latest_excel_on_desktop() -> Path:
+    """找桌面上最新的 1957 爬蟲 Excel。"""
+
     desktop = Path.home() / "Desktop"
-    candidates = sorted(desktop.glob("1957縣市政策_*.xlsx"), key=lambda path: path.stat().st_mtime, reverse=True)
+    candidates = sorted(desktop.glob("1957政策_*.xlsx"), key=lambda path: path.stat().st_mtime, reverse=True)
     if not candidates:
-        raise FileNotFoundError("桌面找不到 1957縣市政策_*.xlsx")
+        raise FileNotFoundError("桌面找不到 1957政策_*.xlsx")
     return candidates[0]
 
 
 def build_runtime_args() -> dict[str, Any]:
+    """建立本次執行會用到的檔案路徑與時間標籤。"""
+
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     workspace = Path.cwd()
     return {
@@ -78,6 +111,8 @@ def build_runtime_args() -> dict[str, Any]:
 
 
 def choose_driver() -> str:
+    """從候選清單中挑選本機可用的 SQL Server ODBC driver。"""
+
     installed = set(pyodbc.drivers())
     for driver in DRIVER_CANDIDATES:
         if driver in installed:
@@ -86,6 +121,12 @@ def choose_driver() -> str:
 
 
 def connect(*, autocommit: bool) -> pyodbc.Connection:
+    """建立 pyodbc 連線。
+
+    autocommit=True 通常用在查詢、備份表建立。
+    autocommit=False 用在需要交易保護的覆蓋寫入流程。
+    """
+
     driver = choose_driver()
     conn_str = (
         f"DRIVER={{{driver}}};"
@@ -98,6 +139,8 @@ def connect(*, autocommit: bool) -> pyodbc.Connection:
 
 
 def normalize_text(value: Any) -> str | None:
+    """把 Excel 讀進來的值轉成可預期的字串或 None。"""
+
     if value is None or pd.isna(value):
         return None
     text = str(value).strip()
@@ -105,17 +148,23 @@ def normalize_text(value: Any) -> str | None:
 
 
 def normalize_required_text(value: Any) -> str:
+    """必填文字欄位版本；缺值時回空字串而不是 None。"""
+
     text = normalize_text(value)
     return text or ""
 
 
 def normalize_int(value: Any) -> int | None:
+    """把數值欄位轉成 int，缺值則回 None。"""
+
     if value is None or pd.isna(value):
         return None
     return int(value)
 
 
 def normalize_datetime(value: Any) -> datetime | None:
+    """將 Excel 讀進來的日期欄位統一成 datetime。"""
+
     if value is None or pd.isna(value):
         return None
     if isinstance(value, datetime):
@@ -124,6 +173,8 @@ def normalize_datetime(value: Any) -> datetime | None:
 
 
 def normalize_enabled(value: Any) -> str:
+    """把布林/數字/字串狀態統一轉成 DB 使用的 啟用 / 停用。"""
+
     if isinstance(value, bool):
         return "啟用" if value else "停用"
     if isinstance(value, (int, float)) and not pd.isna(value):
@@ -133,6 +184,17 @@ def normalize_enabled(value: Any) -> str:
 
 
 def parse_id_list(value: Any) -> list[int]:
+    """解析多選 code 欄位。
+
+    Excel 這些欄位可能長成：
+    - 真正的 list/tuple
+    - JSON 字串
+    - Python list 字串
+    - 單一數值
+
+    這裡集中處理，避免主流程到處判斷型別。
+    """
+
     if value is None or pd.isna(value):
         return []
     if isinstance(value, list):
@@ -157,6 +219,12 @@ def parse_id_list(value: Any) -> list[int]:
 
 
 def infer_policy_code_id(row: dict[str, Any]) -> tuple[int | None, str | None]:
+    """補判斷 CodePolicyID。
+
+    正常情況下爬蟲輸出就應該已有 CodePolicyID，
+    這裡是匯入前最後一道保底，處理少數 label 與實際內容不完全一致的案例。
+    """
+
     current_id = normalize_int(row.get("CodePolicyID"))
     if current_id is not None:
         return current_id, None
@@ -189,6 +257,15 @@ def infer_policy_code_id(row: dict[str, Any]) -> tuple[int | None, str | None]:
 
 
 def load_rows(excel_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """讀取 ifare_policy 工作表，並整理成可寫 DB 的 rows。
+
+    除了欄位正規化，這裡還會統計：
+    - override 使用次數
+    - 仍未解決的福利分類
+    - validation error
+    - 關聯表預計寫入筆數
+    """
+
     df = pd.read_excel(excel_path, sheet_name=SHEET_NAME)
     rows = df.to_dict(orient="records")
 
@@ -205,6 +282,7 @@ def load_rows(excel_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
         prepared_rows.append(
             {
+                # 這一層 prepared_rows 的欄位名稱，已經盡量直接對齊 DB insert 流程。
                 "Title": normalize_required_text(row.get("Title")),
                 "Qualification": normalize_required_text(row.get("Qualification")),
                 "WelfareInfo": normalize_required_text(row.get("WelfareInfo")),
@@ -237,6 +315,7 @@ def load_rows(excel_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     missing_release = sum(1 for row in prepared_rows if row["ReleaseTime"] is None)
     missing_title = sum(1 for row in prepared_rows if not row["Title"])
 
+    # 這些是正式寫 DB 前的最低門檻；任何一項缺漏都直接中止。
     if missing_policy:
         validation_errors.append(f"仍有 {missing_policy} 筆缺少 CodePolicyID")
     if missing_domicile:
@@ -262,10 +341,14 @@ def load_rows(excel_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
 
 def quote_ident(name: str) -> str:
+    """安全包裝 SQL 識別名稱，避免名稱中有 ] 時出錯。"""
+
     return f"[{name.replace(']', ']]')}]"
 
 
 def build_backup_table_map(label: str) -> dict[str, str]:
+    """依本次執行時間標籤，產生備份表名稱。"""
+
     return {
         POLICY_TABLE: f"dbo._bak_{label}_IFarePolicy",
         "dbo.IFarePolicy_CodeKeyword": f"dbo._bak_{label}_IFarePolicy_CodeKeyword",
@@ -276,6 +359,8 @@ def build_backup_table_map(label: str) -> dict[str, str]:
 
 
 def table_exists(cursor: pyodbc.Cursor, table_name: str) -> bool:
+    """確認指定資料表是否已存在。"""
+
     schema_name, object_name = table_name.split(".", 1)
     sql = """
     SELECT 1
@@ -287,6 +372,12 @@ def table_exists(cursor: pyodbc.Cursor, table_name: str) -> bool:
 
 
 def create_backup_tables(label: str) -> dict[str, str]:
+    """將現有政策資料完整備份成新表。
+
+    這裡故意不用覆蓋舊備份；
+    只要同名備份表已存在，就直接報錯停止，避免把還原點洗掉。
+    """
+
     backup_table_map = build_backup_table_map(label)
     with connect(autocommit=True) as conn:
         cursor = conn.cursor()
@@ -300,6 +391,14 @@ def create_backup_tables(label: str) -> dict[str, str]:
 
 
 def build_restore_sql(label: str, backup_table_map: dict[str, str]) -> str:
+    """產生可完整回滾本次匯入的 SQL 腳本。
+
+    設計重點：
+    - 先刪關聯表，再刪主表
+    - 用 IDENTITY_INSERT 保留原本備份中的 ID
+    - 用交易包住整個還原流程
+    """
+
     def table_object(name: str) -> str:
         schema_name, object_name = name.split(".", 1)
         return f"{quote_ident(schema_name)}.{quote_ident(object_name)}"
@@ -361,10 +460,14 @@ def build_restore_sql(label: str, backup_table_map: dict[str, str]) -> str:
 
 
 def write_restore_sql(path: Path, content: str) -> None:
+    """把 restore SQL 寫到檔案，供之後回滾使用。"""
+
     path.write_text(content, encoding="utf-8")
 
 
 def fetch_table_counts() -> dict[str, int]:
+    """抓主表與關聯表目前筆數，方便比對匯入前後差異。"""
+
     counts: dict[str, int] = {}
     with connect(autocommit=True) as conn:
         cursor = conn.cursor()
@@ -375,18 +478,35 @@ def fetch_table_counts() -> dict[str, int]:
 
 
 def reset_identity(cursor: pyodbc.Cursor, table_name: str) -> None:
+    """把 identity reseed 回 0，讓新資料從 1 開始累加。"""
+
     cursor.execute(f"DBCC CHECKIDENT ('{table_name}', RESEED, 0) WITH NO_INFOMSGS;")
 
 
 def replace_policy_data(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """以交易方式整批覆蓋 IFare 政策資料。
+
+    流程是：
+    1. 清關聯表
+    2. 清主表
+    3. reset identity
+    4. 寫主表
+    5. 收集並批次寫入多對多關聯表
+    6. commit
+
+    只要中間任何一步失敗，因為 autocommit=False，整批交易都不會落地。
+    """
+
     with connect(autocommit=False) as conn:
         cursor = conn.cursor()
         cursor.fast_executemany = True
 
+        # 刪除順序必須先子表再主表，否則會撞到 FK。
         for table_name, _, _ in LINK_TABLE_SPECS:
             cursor.execute(f"DELETE FROM {table_name};")
         cursor.execute(f"DELETE FROM {POLICY_TABLE};")
 
+        # 既然是全量重建，就順便把 identity 重新歸零，讓 ID 重新連續。
         reset_identity(cursor, POLICY_TABLE)
         for table_name, _, _ in LINK_TABLE_SPECS:
             reset_identity(cursor, table_name)
@@ -407,6 +527,7 @@ def replace_policy_data(rows: list[dict[str, Any]]) -> dict[str, int]:
         now = datetime.now()
 
         for row in rows:
+            # 主表先寫入，拿到 IFarePolicy.ID 後，才能建立關聯表資料。
             cursor.execute(
                 main_insert_sql,
                 now,
@@ -435,6 +556,7 @@ def replace_policy_data(rows: list[dict[str, Any]]) -> dict[str, int]:
                     (now, policy_id, code_id) for code_id in row[excel_column]
                 )
 
+        # 關聯表改用 executemany，避免一筆一筆 insert 過慢。
         for table_name, link_column, _ in LINK_TABLE_SPECS:
             rows_to_insert = child_buffers[table_name]
             if not rows_to_insert:
@@ -450,10 +572,19 @@ def replace_policy_data(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def write_report(path: Path, payload: dict[str, Any]) -> None:
+    """輸出本次執行報告，方便追蹤與稽核。"""
+
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def main() -> None:
+    """主執行流程。
+
+    真正寫 DB 前的關鍵防線有兩道：
+    - load_rows() 的 validation_errors
+    - create_backup_tables() 成功建立可回滾資料
+    """
+
     runtime = build_runtime_args()
     excel_path: Path = runtime["excel"]
     backup_label: str = runtime["backup_label"]
@@ -464,6 +595,7 @@ def main() -> None:
     if metadata["validation_errors"]:
         raise RuntimeError("；".join(metadata["validation_errors"]))
 
+    # 先記錄匯入前筆數，再建立備份與還原腳本，最後才正式覆蓋資料。
     counts_before = fetch_table_counts()
     backup_table_map = create_backup_tables(backup_label)
     write_restore_sql(restore_sql_path, build_restore_sql(backup_label, backup_table_map))
