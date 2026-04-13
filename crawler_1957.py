@@ -12,12 +12,10 @@ import pandas as pd
 
 
 def _load_base_module():
-
-
     current_file = Path(__file__).resolve()
+    base_module_path = current_file.with_name("crawler_1957_core.py")
     candidates = [
-        Path(r"D:\Users\user01\Documents\New project\1957_crawler\crawler_1957.py"),
-        Path(r"D:\Users\user01\Downloads\crawler_1957.py"),
+        base_module_path,
     ]
 
     for candidate in candidates:
@@ -35,7 +33,9 @@ def _load_base_module():
         spec.loader.exec_module(module)
         return module
 
-    raise FileNotFoundError("找不到可載入的 crawler_1957 核心檔案")
+    raise FileNotFoundError(
+        f"找不到可載入的 crawler_1957 核心檔案：{base_module_path}"
+    )
 
 
 base = _load_base_module()
