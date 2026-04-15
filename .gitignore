@@ -5,3 +5,6 @@ uv.lock
 pyproject.toml
 
 /__pycache__
+*.xlsx
+restore_ifare_policy_*.sql
+replace_ifare_policy_report_*.json
