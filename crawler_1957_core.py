@@ -270,7 +270,59 @@ POLICY_LABEL_ALIASES = {
     normalize_lookup_key("原住民族福利"): "原民福利",
     normalize_lookup_key("長期照護"): "長期照顧",
     normalize_lookup_key("身心障礙服務"): "身心障礙福利",
+    normalize_lookup_key("微型保險"): "各式民間資源",
 }
+
+
+DISCONTINUED_POLICY_REDIRECTS = {
+    normalize_lookup_key("身心障礙服務"): "身心障礙福利",
+    normalize_lookup_key("微型保險"): "各式民間資源",
+}
+
+
+POLICY_OTHER_WELFARE_STRONG_PATTERNS = [
+    r"就學補助",
+    r"助學金",
+    r"獎助學金",
+    r"獎學金",
+    r"學雜費補助",
+    r"學費補助",
+    r"教育補助",
+]
+
+
+POLICY_OTHER_WELFARE_EDU_PATTERNS = [
+    r"就學",
+    r"助學",
+    r"學生",
+    r"學生生活",
+    r"學雜費",
+    r"學費",
+    r"教育",
+]
+
+
+POLICY_OTHER_WELFARE_BENEFIT_PATTERNS = [
+    r"補助",
+    r"津貼",
+    r"補貼",
+    r"給付",
+    r"救助",
+    r"扶助",
+    r"獎助",
+]
+
+
+POLICY_MISC_FALLBACK_PATTERNS = [
+    r"補助",
+    r"津貼",
+    r"補貼",
+    r"給付",
+    r"救助",
+    r"扶助",
+    r"慰問金",
+    r"獎助",
+]
 
 
 DOMICILE_LABEL_ALIASES = {
@@ -281,6 +333,31 @@ DOMICILE_LABEL_ALIASES = {
     normalize_lookup_key("臺南市"): "台南市",
     normalize_lookup_key("臺東縣"): "台東縣",
 }
+
+
+def canonicalize_policy_label(label: str) -> str:
+    normalized = normalize_space(label)
+    if not normalized:
+        return ""
+    return POLICY_LABEL_ALIASES.get(normalize_lookup_key(normalized), normalized)
+
+
+def is_education_support_policy(text: str) -> bool:
+    normalized = normalize_space(text)
+    if not normalized:
+        return False
+    if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in POLICY_OTHER_WELFARE_STRONG_PATTERNS):
+        return True
+    has_edu = any(re.search(pattern, normalized, re.IGNORECASE) for pattern in POLICY_OTHER_WELFARE_EDU_PATTERNS)
+    has_benefit = any(re.search(pattern, normalized, re.IGNORECASE) for pattern in POLICY_OTHER_WELFARE_BENEFIT_PATTERNS)
+    return has_edu and has_benefit
+
+
+def looks_like_misc_welfare_policy(text: str) -> bool:
+    normalized = normalize_space(text)
+    if not normalized:
+        return False
+    return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in POLICY_MISC_FALLBACK_PATTERNS)
 
 
 SECTION_ALIAS_GROUPS = {
@@ -421,7 +498,11 @@ class Mohw1957CountyCrawler:
     ) -> None:
         self.root_cate_id = str(root_cate_id)
         self.county_filters = county_filters or set()
-        self.category_filters = category_filters or set()
+        self.category_filters = {
+            canonicalize_policy_label(item)
+            for item in (category_filters or set())
+            if normalize_space(item)
+        }
         self.sleep_seconds = sleep_seconds
         self.max_policies = max_policies
         self.timeout = timeout
@@ -500,7 +581,11 @@ class Mohw1957CountyCrawler:
             return True
         if current_path and current_path[0] == "縣市福利" and "服務窗口" in card.label:
             return True
-        if self.category_filters and card.action == "showQAData" and card.label not in self.category_filters:
+        if (
+            self.category_filters
+            and card.action == "showQAData"
+            and canonicalize_policy_label(card.label) not in self.category_filters
+        ):
             return True
         return False
 
@@ -735,11 +820,11 @@ class Mohw1957CountyCrawler:
 
         if first_level == "縣市福利":
             county_label = second_level
-            welfare_category = third_level
+            welfare_category = canonicalize_policy_label(third_level)
             welfare_subcategory = group_title
         else:
             county_label = "全國"
-            welfare_category = first_level
+            welfare_category = canonicalize_policy_label(first_level)
             welfare_subcategory = second_level
 
         return first_level, second_level, third_level, county_label, welfare_category, welfare_subcategory
@@ -1020,14 +1105,6 @@ class Mohw1957CountyCrawler:
         title = truncate_for_db(raw_title, 50, "Title", warnings)
         title_was_trimmed = title != raw_title
 
-        code_policy_id, code_policy_label = self._lookup_policy_code(str(raw_row["福利分類"]))
-        if code_policy_id is None:
-            warnings.append(f"找不到 CodePolicyID: {raw_row['福利分類']}")
-
-        code_domicile_id, code_domicile_label = self._lookup_domicile_code(str(raw_row["縣市"]))
-        if code_domicile_id is None:
-            warnings.append(f"找不到 CodeDomicileID: {raw_row['縣市']}")
-
         content_blob = "\n".join(
             part
             for part in [
@@ -1041,6 +1118,16 @@ class Mohw1957CountyCrawler:
             ]
             if part
         )
+
+        code_policy_id, code_policy_label, policy_warning = self._resolve_policy_code(str(raw_row["福利分類"]), content_blob)
+        if policy_warning:
+            warnings.append(policy_warning)
+        if code_policy_id is None:
+            warnings.append(f"找不到 CodePolicyID: {raw_row['福利分類']}")
+
+        code_domicile_id, code_domicile_label = self._lookup_domicile_code(str(raw_row["縣市"]))
+        if code_domicile_id is None:
+            warnings.append(f"找不到 CodeDomicileID: {raw_row['縣市']}")
 
         keyword_ids, keyword_labels = self._infer_multi_codes(content_blob, RAW_CODE_KEYWORD_MAP, KEYWORD_PATTERNS, None)
         if not keyword_ids and re.search(r"補助|津貼|補貼|給付|救助", content_blob):
@@ -1121,9 +1208,41 @@ class Mohw1957CountyCrawler:
         }
         return db_row, payload
 
+    def _resolve_policy_code(self, label: str, content_blob: str) -> tuple[int | None, str, str | None]:
+        raw_label = normalize_space(label)
+        raw_key = normalize_lookup_key(raw_label)
+        canonical = canonicalize_policy_label(raw_label)
+
+        if is_education_support_policy(content_blob):
+            return (
+                RAW_CODE_POLICY_MAP["其他福利"],
+                "其他福利",
+                "就學補助／教育補助案件改歸其他福利",
+            )
+
+        if raw_key in DISCONTINUED_POLICY_REDIRECTS:
+            redirected = DISCONTINUED_POLICY_REDIRECTS[raw_key]
+            return (
+                RAW_CODE_POLICY_MAP[redirected],
+                redirected,
+                f"{raw_label} 為停用分類，已改歸 {redirected}",
+            )
+
+        code_policy_id = CODE_POLICY_LOOKUP.get(normalize_lookup_key(canonical))
+        if code_policy_id is not None:
+            return code_policy_id, canonical, None
+
+        if looks_like_misc_welfare_policy(content_blob):
+            return (
+                RAW_CODE_POLICY_MAP["其他福利"],
+                "其他福利",
+                f"{raw_label or '未分類政策'} 難以明確分類，保守改歸其他福利",
+            )
+
+        return None, canonical, None
+
     def _lookup_policy_code(self, label: str) -> tuple[int | None, str]:
-        key = normalize_lookup_key(label)
-        canonical = POLICY_LABEL_ALIASES.get(key, normalize_space(label))
+        canonical = canonicalize_policy_label(label)
         return CODE_POLICY_LOOKUP.get(normalize_lookup_key(canonical)), canonical
 
     def _lookup_domicile_code(self, label: str) -> tuple[int | None, str]:

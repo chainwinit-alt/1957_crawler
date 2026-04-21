@@ -196,14 +196,6 @@ class Mohw1957CountyCrawler(base.Mohw1957CountyCrawler):
         title = preserve_full_text(raw_title, 50, "Title", warnings)
         title_was_trimmed = False
 
-        code_policy_id, code_policy_label = self._lookup_policy_code(str(raw_row["福利分類"]))
-        if code_policy_id is None:
-            warnings.append(f"找不到 CodePolicyID: {raw_row['福利分類']}")
-
-        code_domicile_id, code_domicile_label = self._lookup_domicile_code(str(raw_row["縣市"]))
-        if code_domicile_id is None:
-            warnings.append(f"找不到 CodeDomicileID: {raw_row['縣市']}")
-
         evidence_text = detail["evidence_text"]
         if not evidence_text:
             evidence_text = infer_evidence_from_apply_text(detail["apply_text"])
@@ -223,6 +215,16 @@ class Mohw1957CountyCrawler(base.Mohw1957CountyCrawler):
             ]
             if part
         )
+
+        code_policy_id, code_policy_label, policy_warning = self._resolve_policy_code(str(raw_row["福利分類"]), content_blob)
+        if policy_warning:
+            warnings.append(policy_warning)
+        if code_policy_id is None:
+            warnings.append(f"找不到 CodePolicyID: {raw_row['福利分類']}")
+
+        code_domicile_id, code_domicile_label = self._lookup_domicile_code(str(raw_row["縣市"]))
+        if code_domicile_id is None:
+            warnings.append(f"找不到 CodeDomicileID: {raw_row['縣市']}")
 
         keyword_ids, keyword_labels = self._infer_multi_codes(content_blob, base.RAW_CODE_KEYWORD_MAP, base.KEYWORD_PATTERNS, None)
         if not keyword_ids and base.re.search(r"補助|津貼|補貼|給付|救助", content_blob):
