@@ -80,6 +80,14 @@ DRIVER_CANDIDATES = (
     "SQL Server",
 )
 
+# 既有資料保留規則。
+# `policy` 代表依 CodePolicy.LabelName 判斷；
+# `domicile` 代表依 CodeDomicile.LabelName 判斷。
+# 依你回報「調整編號順序以前版本是正常保留的」情況，
+# 預設先沿用上一版可正常保留的 policy 判斷方式。
+PRESERVE_MATCH_MODE = "policy"
+PRESERVE_LABELS = ("各式民間資源",)
+
 POLICY_CODE_OVERRIDES = {
     "婦女福利": 4,
     "家庭及婦女福利": 4,
@@ -233,6 +241,33 @@ def normalize_required_text(value: Any) -> str:
     return text or ""
 
 
+def get_preserve_match_sql_info() -> dict[str, str]:
+    """回傳保留既有資料時要比對的欄位設定。"""
+
+    if PRESERVE_MATCH_MODE == "policy":
+        return {
+            "where_expr": "code_policy.LabelName",
+            "source_row_label_key": "CodePolicyLabel",
+        }
+    if PRESERVE_MATCH_MODE == "domicile":
+        return {
+            "where_expr": "code_domicile.LabelName",
+            "source_row_label_key": "",
+        }
+    raise RuntimeError(
+        f"PRESERVE_MATCH_MODE={PRESERVE_MATCH_MODE!r} 不支援，請使用 policy 或 domicile"
+    )
+
+
+def should_skip_source_row(row: dict[str, Any]) -> bool:
+    """若來源 Excel 本身也包含保留分類，則跳過避免和舊資料重複。"""
+
+    label_key = get_preserve_match_sql_info()["source_row_label_key"]
+    if not label_key:
+        return False
+    return normalize_text(row.get(label_key)) in PRESERVE_LABELS
+
+
 def normalize_int(value: Any) -> int | None:
     """把數值欄位轉成 int，缺值則回 None。"""
 
@@ -343,6 +378,7 @@ def load_rows(excel_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     - 仍未解決的福利分類
     - validation error
     - 關聯表預計寫入筆數
+    - 因保留策略而略過的來源筆數
     """
 
     df = pd.read_excel(excel_path, sheet_name=SHEET_NAME)
@@ -388,11 +424,15 @@ def load_rows(excel_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
             }
         )
 
+    source_rows = prepared_rows
+    rows_to_write = [row for row in source_rows if not should_skip_source_row(row)]
+    skipped_preserved_source_rows = len(source_rows) - len(rows_to_write)
+
     validation_errors: list[str] = []
-    missing_policy = sum(1 for row in prepared_rows if row["CodePolicyID"] is None)
-    missing_domicile = sum(1 for row in prepared_rows if row["CodeDomicileID"] is None)
-    missing_release = sum(1 for row in prepared_rows if row["ReleaseTime"] is None)
-    missing_title = sum(1 for row in prepared_rows if not row["Title"])
+    missing_policy = sum(1 for row in rows_to_write if row["CodePolicyID"] is None)
+    missing_domicile = sum(1 for row in rows_to_write if row["CodeDomicileID"] is None)
+    missing_release = sum(1 for row in rows_to_write if row["ReleaseTime"] is None)
+    missing_title = sum(1 for row in rows_to_write if not row["Title"])
 
     # 這些是正式寫 DB 前的最低門檻；任何一項缺漏都直接中止。
     if missing_policy:
@@ -405,18 +445,22 @@ def load_rows(excel_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         validation_errors.append(f"仍有 {missing_title} 筆缺少 Title")
 
     child_counts = {
-        link_column: sum(len(row[excel_column]) for row in prepared_rows)
+        link_column: sum(len(row[excel_column]) for row in rows_to_write)
         for _, link_column, excel_column in LINK_TABLE_SPECS
     }
     metadata = {
-        "row_count": len(prepared_rows),
+        "source_row_count": len(source_rows),
+        "row_count": len(rows_to_write),
+        "skipped_preserved_source_row_count": skipped_preserved_source_rows,
+        "preserve_match_mode": PRESERVE_MATCH_MODE,
+        "preserve_labels": list(PRESERVE_LABELS),
         "override_counter": dict(override_counter),
         "unresolved_labels": dict(unresolved_labels),
         "validation_errors": validation_errors,
         "child_counts": child_counts,
-        "warning_row_count": sum(1 for row in prepared_rows if row["MappingWarnings"]),
+        "warning_row_count": sum(1 for row in rows_to_write if row["MappingWarnings"]),
     }
-    return prepared_rows, metadata
+    return rows_to_write, metadata
 
 
 def quote_ident(name: str) -> str:
@@ -556,22 +600,125 @@ def fetch_table_counts() -> dict[str, int]:
     return counts
 
 
-def reset_identity(cursor: pyodbc.Cursor, table_name: str) -> None:
-    """把 identity reseed 回 0，讓新資料從 1 開始累加。"""
+def load_preserved_policy_rows(cursor: pyodbc.Cursor) -> list[dict[str, Any]]:
+    """先把應保留的既有政策資料抓出來，供後續全刪後重新補回。"""
 
-    cursor.execute(f"DBCC CHECKIDENT ('{table_name}', RESEED, 0) WITH NO_INFOMSGS;")
+    if not PRESERVE_LABELS:
+        return []
+
+    preserve_info = get_preserve_match_sql_info()
+    where_expr = preserve_info["where_expr"]
+    placeholders = ", ".join("?" for _ in PRESERVE_LABELS)
+    params = tuple(PRESERVE_LABELS)
+
+    main_sql = f"""
+    SELECT
+        policy.ID,
+        policy.CreateTime,
+        policy.UpdateTime,
+        policy.Title,
+        policy.CodePolicy_ID,
+        policy.CodeDomicile_ID,
+        policy.IFareOfficeUnit_ID,
+        policy.OfficeUnit_Info,
+        policy.OfficeUnit_Tel,
+        policy.CompetentAuthority,
+        policy.Qualification,
+        policy.WelfareInfo,
+        policy.Evidence,
+        policy.Remark,
+        policy.State,
+        policy.ReleaseTime,
+        policy.DiscontinuedTime,
+        policy.CreateUser_ID,
+        policy.UpdateUser_ID,
+        code_policy.LabelName,
+        code_domicile.LabelName
+    FROM {POLICY_TABLE} AS policy
+    LEFT JOIN dbo.CodePolicy AS code_policy ON code_policy.ID = policy.CodePolicy_ID
+    LEFT JOIN dbo.CodeDomicile AS code_domicile ON code_domicile.ID = policy.CodeDomicile_ID
+    WHERE {where_expr} IN ({placeholders})
+    ORDER BY policy.ID;
+    """
+
+    preserved_rows: list[dict[str, Any]] = []
+    preserved_row_map: dict[int, dict[str, Any]] = {}
+
+    for db_row in cursor.execute(main_sql, params).fetchall():
+        old_policy_id = int(db_row[0])
+        prepared = {
+            "OldPolicyID": old_policy_id,
+            "CreateTime": db_row[1],
+            "UpdateTime": db_row[2],
+            "Title": normalize_required_text(db_row[3]),
+            "CodePolicyID": normalize_int(db_row[4]),
+            "CodeDomicileID": normalize_int(db_row[5]),
+            "IFareOfficeUnitID": normalize_int(db_row[6]) or DEFAULT_OFFICE_UNIT_ID,
+            "OfficeUnitInfo": normalize_required_text(db_row[7]),
+            "OfficeUnitTel": normalize_required_text(db_row[8]),
+            "CompetentAuthority": normalize_required_text(db_row[9]),
+            "Qualification": normalize_required_text(db_row[10]),
+            "WelfareInfo": normalize_required_text(db_row[11]),
+            "Evidence": normalize_required_text(db_row[12]),
+            "Remark": normalize_required_text(db_row[13]),
+            "State": normalize_required_text(db_row[14]),
+            "ReleaseTime": normalize_datetime(db_row[15]),
+            "DiscontinuedTime": normalize_datetime(db_row[16]),
+            "CreateUserID": normalize_int(db_row[17]) or CREATE_USER_ID,
+            "UpdateUserID": normalize_int(db_row[18]) or CREATE_USER_ID,
+            "CodePolicyLabel": normalize_text(db_row[19]),
+            "CodeDomicileLabel": normalize_text(db_row[20]),
+            "CodeIndentityIDs": [],
+            "CodeIncomeIDs": [],
+            "CodeRecipientIDs": [],
+            "CodeKeywordIDs": [],
+        }
+        preserved_rows.append(prepared)
+        preserved_row_map[old_policy_id] = prepared
+
+    for table_name, link_column, excel_column in LINK_TABLE_SPECS:
+        child_sql = f"""
+        SELECT child.IFarePolicy_ID, child.[{link_column}]
+        FROM {table_name} AS child
+        INNER JOIN {POLICY_TABLE} AS policy ON policy.ID = child.IFarePolicy_ID
+        LEFT JOIN dbo.CodePolicy AS code_policy ON code_policy.ID = policy.CodePolicy_ID
+        LEFT JOIN dbo.CodeDomicile AS code_domicile ON code_domicile.ID = policy.CodeDomicile_ID
+        WHERE {where_expr} IN ({placeholders})
+        ORDER BY child.IFarePolicy_ID, child.ID;
+        """
+        for old_policy_id, code_id in cursor.execute(child_sql, params).fetchall():
+            preserved_row = preserved_row_map.get(int(old_policy_id))
+            if preserved_row is not None:
+                preserved_row[excel_column].append(int(code_id))
+
+    if not preserved_rows:
+        raise RuntimeError(
+            "找不到任何需保留的既有資料。已設定保留模式："
+            f"{PRESERVE_MATCH_MODE}，保留標籤：{list(PRESERVE_LABELS)}。"
+            "為避免誤刪，程式已中止，請先確認實際是用 CodePolicy 還是 CodeDomicile。"
+        )
+
+    return preserved_rows
+
+
+def reset_identity(cursor: pyodbc.Cursor, table_name: str) -> None:
+    """依目前表內最大 ID reseed，兼容「部分保留、部分重建」的情境。"""
+
+    current_max = int(cursor.execute(f"SELECT ISNULL(MAX(ID), 0) FROM {table_name};").fetchone()[0])
+    cursor.execute(f"DBCC CHECKIDENT ('{table_name}', RESEED, {current_max}) WITH NO_INFOMSGS;")
 
 
 def replace_policy_data(rows: list[dict[str, Any]]) -> dict[str, int]:
     """以交易方式整批覆蓋 IFare 政策資料。
 
     流程是：
-    1. 清關聯表
-    2. 清主表
-    3. reset identity
-    4. 寫主表
-    5. 收集並批次寫入多對多關聯表
-    6. commit
+    1. 先把應保留的既有分類抓出來
+    2. 清關聯表
+    3. 清主表
+    4. reset identity
+    5. 先寫 Excel 新政策
+    6. 再把保留政策補回，讓它們排在後面
+    7. 寫入多對多關聯表後 commit
 
     只要中間任何一步失敗，因為 autocommit=False，整批交易都不會落地。
     """
@@ -579,13 +726,14 @@ def replace_policy_data(rows: list[dict[str, Any]]) -> dict[str, int]:
     with connect(autocommit=False) as conn:
         cursor = conn.cursor()
         cursor.fast_executemany = True
+        preserved_rows = load_preserved_policy_rows(cursor)
 
         # 刪除順序必須先子表再主表，否則會撞到 FK。
         for table_name, _, _ in LINK_TABLE_SPECS:
             cursor.execute(f"DELETE FROM {table_name};")
         cursor.execute(f"DELETE FROM {POLICY_TABLE};")
 
-        # 既然是全量重建，就順便把 identity 重新歸零，讓 ID 重新連續。
+        # 全刪後 reseed，新的 Excel 政策就會從 1 開始編號。
         reset_identity(cursor, POLICY_TABLE)
         for table_name, _, _ in LINK_TABLE_SPECS:
             reset_identity(cursor, table_name)
@@ -604,13 +752,14 @@ def replace_policy_data(rows: list[dict[str, Any]]) -> dict[str, int]:
             table_name: [] for table_name, _, _ in LINK_TABLE_SPECS
         }
         now = datetime.now()
+        rows_in_insert_order = [*rows, *preserved_rows]
 
-        for row in rows:
+        for row in rows_in_insert_order:
             # 主表先寫入，拿到 IFarePolicy.ID 後，才能建立關聯表資料。
             cursor.execute(
                 main_insert_sql,
-                now,
-                now,
+                row.get("CreateTime") or now,
+                row.get("UpdateTime") or now,
                 row["Title"],
                 row["CodePolicyID"],
                 row["CodeDomicileID"],
@@ -625,8 +774,8 @@ def replace_policy_data(rows: list[dict[str, Any]]) -> dict[str, int]:
                 row["State"],
                 row["ReleaseTime"],
                 row["DiscontinuedTime"],
-                CREATE_USER_ID,
-                CREATE_USER_ID,
+                row.get("CreateUserID") or CREATE_USER_ID,
+                row.get("UpdateUserID") or CREATE_USER_ID,
             )
             policy_id = int(cursor.fetchone()[0])
 
@@ -685,6 +834,8 @@ def main() -> None:
         "auth_mode": ACTIVE_DB_CONFIG["auth_mode"],
         "server": SERVER,
         "database": DATABASE,
+        "preserve_match_mode": metadata["preserve_match_mode"],
+        "preserve_labels": metadata["preserve_labels"],
         "excel_path": str(excel_path),
         "sheet_name": SHEET_NAME,
         "backup_label": backup_label,
@@ -692,7 +843,9 @@ def main() -> None:
         "restore_sql_path": str(restore_sql_path),
         "counts_before": counts_before,
         "counts_after": counts_after,
+        "source_rows": metadata["source_row_count"],
         "prepared_rows": metadata["row_count"],
+        "skipped_preserved_source_rows": metadata["skipped_preserved_source_row_count"],
         "warning_row_count": metadata["warning_row_count"],
         "override_counter": metadata["override_counter"],
         "unresolved_labels": metadata["unresolved_labels"],
